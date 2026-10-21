@@ -1,0 +1,20 @@
+FROM docker.m.daocloud.io/library/python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+COPY infra/requirements-mock-erp.txt ./
+RUN pip install --no-cache-dir -r requirements-mock-erp.txt
+
+COPY apps ./apps
+
+EXPOSE 8010
+
+HEALTHCHECK --interval=10s --timeout=5s --retries=10 \
+    CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8010/admin/state')"
+
+CMD ["uvicorn", "apps.mock_erp.main:app", "--host", "0.0.0.0", "--port", "8010"]

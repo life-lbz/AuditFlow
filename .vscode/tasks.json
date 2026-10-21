@@ -1,0 +1,11 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "check-terminal",
+			"type": "shell",
+			"command": "Write-Host 'task-terminal-ok'; Get-Location",
+			"isBackground": false
+		}
+	]
+}

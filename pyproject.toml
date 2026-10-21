@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auditflow"
+version = "0.1.0"
+description = "多模态财务审核智能体（单 Decision Agent + 确定性工作流编排）"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.141",
+    "uvicorn>=0.52",
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic>=1.19",
+    "asyncpg>=0.30",
+    "aiosqlite>=0.20",
+    "pydantic>=2.13",
+    "pydantic-settings>=2.15",
+    "httpx>=0.28",
+    "redis>=8.1",
+    "minio>=7.2",
+    "python-multipart>=0.0.9",
+    "orjson>=3.10",
+    "pypdf>=6.0",
+    "pillow>=11.0",
+    "reportlab>=4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "pytest-cov>=7.1",
+    "aiosqlite>=0.20",
+    "ruff>=0.17",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+exclude = ["data", "apps/web", ".venv", "alembic/versions"]
+
+[tool.ruff.lint]
+# 门禁只拦「确定是错误」的规则：语法错误 + 未定义名 + 未使用导入/变量。
+# 风格类规则（E501 行长、B008 FastAPI Depends 等）不进 CI，避免噪声阻塞交付。
+select = ["E9", "F"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["packages*", "apps*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "apps/mock_erp/tests"]

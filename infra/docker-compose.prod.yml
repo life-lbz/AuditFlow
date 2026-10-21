@@ -1,0 +1,116 @@
+name: auditflow-prod
+
+# 生产态编排：镜像自包含（不挂源码、不在运行时 pip install），
+# api 启动前自动执行 alembic upgrade head，web 由 nginx 托管静态资源并反代 /api。
+#
+# 启动：
+#   AUTH_SECRET=$(openssl rand -hex 32) docker compose -f infra/docker-compose.prod.yml up -d --build
+# 冒烟：
+#   python infra/smoke_test.py --base http://localhost:8080/api
+
+services:
+  postgres:
+    image: docker.m.daocloud.io/pgvector/pgvector:pg16
+    container_name: auditflow-prod-postgres
+    environment:
+      POSTGRES_USER: auditflow
+      POSTGRES_PASSWORD: auditflow
+      POSTGRES_DB: auditflow
+    volumes:
+      - prod_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auditflow -d auditflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    container_name: auditflow-prod-redis
+    volumes:
+      - prod_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: docker.1panel.live/minio/minio:latest
+    container_name: auditflow-prod-minio
+    environment:
+      MINIO_ROOT_USER: auditflow
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-auditflow123}
+    volumes:
+      - prod_minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mock-erp:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.mock-erp
+    container_name: auditflow-prod-mock-erp
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8010/admin/state')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    container_name: auditflow-prod-api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://auditflow:auditflow@postgres:5432/auditflow
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: auditflow
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-auditflow123}
+      MINIO_BUCKET: auditflow-docs
+      STORAGE_BACKEND: minio
+      MOCK_ERP_URL: http://mock-erp:8010
+      MOCK_ERP_INPROCESS: "false"
+      MODEL_PROVIDER: ${MODEL_PROVIDER:-stub}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_NAME: ${MODEL_NAME:-qwen2.5-7b-instruct}
+      # 生产必须显式提供强密钥；未设置时 compose 直接拒绝启动
+      AUTH_MODE: token
+      AUTH_SECRET: ${AUTH_SECRET:?请设置 AUTH_SECRET（例如 openssl rand -hex 32）}
+      AUTH_TOKEN_TTL_SECS: ${AUTH_TOKEN_TTL_SECS:-3600}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-20}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mock-erp:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.web
+      args:
+        VITE_API_BASE: /api
+    container_name: auditflow-prod-web
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+volumes:
+  prod_postgres_data:
+  prod_redis_data:
+  prod_minio_data:

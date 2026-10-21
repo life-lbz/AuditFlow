@@ -1,0 +1,134 @@
+name: auditflow
+
+services:
+  postgres:
+    image: docker.m.daocloud.io/pgvector/pgvector:pg16
+    container_name: auditflow-postgres
+    environment:
+      POSTGRES_USER: auditflow
+      POSTGRES_PASSWORD: auditflow
+      POSTGRES_DB: auditflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auditflow -d auditflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    container_name: auditflow-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: docker.1panel.live/minio/minio:latest
+    container_name: auditflow-minio
+    environment:
+      MINIO_ROOT_USER: auditflow
+      MINIO_ROOT_PASSWORD: auditflow123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mock-erp:
+    image: docker.m.daocloud.io/library/python:3.12-slim
+    container_name: auditflow-mock-erp
+    working_dir: /app
+    volumes:
+      - ../:/app
+    environment:
+      PYTHONPATH: /app
+      PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+    ports:
+      - "8010:8010"
+    command:
+      - bash
+      - -c
+      - pip install -q --no-cache-dir -r /app/infra/requirements-mock-erp.txt && uvicorn apps.mock_erp.main:app --host 0.0.0.0 --port 8010
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8010/admin/state')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    container_name: auditflow-api
+    working_dir: /app
+    volumes:
+      - ../:/app
+      - pip_cache:/root/.cache/pip
+    environment:
+      PYTHONPATH: /app
+      PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+      DATABASE_URL: postgresql+asyncpg://auditflow:auditflow@postgres:5432/auditflow
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: auditflow
+      MINIO_SECRET_KEY: auditflow123
+      MINIO_BUCKET: auditflow-docs
+      MOCK_ERP_URL: http://mock-erp:8010
+      MODEL_PROVIDER: stub
+      API_PORT: 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mock-erp:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - pip install -q --no-cache-dir -e ".[dev]" && uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+
+  web:
+    image: docker.m.daocloud.io/library/node:22-alpine
+    container_name: auditflow-web
+    working_dir: /app
+    volumes:
+      - ../apps/web:/app
+      - web_modules:/app/node_modules
+    environment:
+      VITE_API_BASE: http://localhost:8000
+    ports:
+      - "5173:5173"
+    command:
+      - sh
+      - -c
+      - npm install --registry=https://registry.npmmirror.com && npm run dev -- --host 0.0.0.0 --port 5173
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  pip_cache:
+  web_modules:

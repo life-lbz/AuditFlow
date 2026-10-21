@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cmd /c rmdir /s /q \"D:\\\\Developers\\\\Anaconda3\\\\envs\\\\webrag\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
