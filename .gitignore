@@ -8,7 +8,12 @@ node_modules/
 dist/
 build/
 .env
+.env.prod
+.env.*.local
 .DS_Store
+
+# 备份产物
+backups/
 
 # 运行期生成的本地存储、SQLite DB 与临时评测产物
 data/_storage/

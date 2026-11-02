@@ -4,29 +4,48 @@ name: auditflow-prod
 # api 启动前自动执行 alembic upgrade head，web 由 nginx 托管静态资源并反代 /api。
 #
 # 启动：
-#   AUTH_SECRET=$(openssl rand -hex 32) docker compose -f infra/docker-compose.prod.yml up -d --build
+#   cp .env.prod.example .env.prod   # 填写 AUTH_SECRET / POSTGRES_PASSWORD / MINIO_SECRET_KEY / CORS_ORIGINS
+#   docker compose --env-file .env.prod -f infra/docker-compose.prod.yml up -d --build
 # 冒烟：
 #   python infra/smoke_test.py --base http://localhost:8080/api
+#
+# 安全要点：api / postgres / redis / minio 均不对外发布端口，只通过 web 的 nginx 暴露 8080；
+# 所有服务位于 internal 网络，宿主机只能访问 web。
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
 
 services:
   postgres:
     image: docker.m.daocloud.io/pgvector/pgvector:pg16
     container_name: auditflow-prod-postgres
+    <<: *default-restart
     environment:
-      POSTGRES_USER: auditflow
-      POSTGRES_PASSWORD: auditflow
-      POSTGRES_DB: auditflow
+      POSTGRES_USER: ${POSTGRES_USER:-auditflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-auditflow}
     volumes:
       - prod_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U auditflow -d auditflow"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-auditflow} -d ${POSTGRES_DB:-auditflow}"]
       interval: 5s
       timeout: 3s
       retries: 20
+    logging: *default-logging
+    networks: [backend]
+    mem_limit: 1g
 
   redis:
     image: docker.m.daocloud.io/library/redis:7-alpine
     container_name: auditflow-prod-redis
+    <<: *default-restart
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - prod_redis_data:/data
     healthcheck:
@@ -34,13 +53,17 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    logging: *default-logging
+    networks: [backend]
+    mem_limit: 256m
 
   minio:
     image: docker.1panel.live/minio/minio:latest
     container_name: auditflow-prod-minio
+    <<: *default-restart
     environment:
-      MINIO_ROOT_USER: auditflow
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-auditflow123}
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-auditflow}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?请设置 MINIO_SECRET_KEY}
     volumes:
       - prod_minio_data:/data
     command: server /data --console-address ":9001"
@@ -49,30 +72,53 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    logging: *default-logging
+    networks: [backend]
+    mem_limit: 512m
 
+  # 演示/联调用 Mock ERP；接入真实 ERP 时应替换为真实系统并删除该服务
   mock-erp:
     build:
       context: ..
       dockerfile: infra/Dockerfile.mock-erp
     container_name: auditflow-prod-mock-erp
+    <<: *default-restart
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8010/admin/state')\""]
       interval: 10s
       timeout: 5s
       retries: 20
+    logging: *default-logging
+    networks: [backend]
+    mem_limit: 256m
 
   api:
     build:
       context: ..
       dockerfile: infra/Dockerfile.api
     container_name: auditflow-prod-api
+    <<: *default-restart
+    init: true
+    stop_grace_period: 30s
+    # 只读根文件系统：应用不写本地盘，证据文件进 MinIO，避免运行时被植入文件
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      # 评测所需的合成票据只读挂载；生产环境不写本地盘
+      - ../data:/app/data:ro
     environment:
-      DATABASE_URL: postgresql+asyncpg://auditflow:auditflow@postgres:5432/auditflow
+      ENVIRONMENT: production
+      APP_VERSION: ${APP_VERSION:-0.1.0}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DOCS_ENABLED: ${DOCS_ENABLED:-false}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-auditflow}:${POSTGRES_PASSWORD:?请设置 POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-auditflow}
       REDIS_URL: redis://redis:6379/0
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: auditflow
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-auditflow123}
-      MINIO_BUCKET: auditflow-docs
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-auditflow}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?请设置 MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-auditflow-docs}
       STORAGE_BACKEND: minio
       MOCK_ERP_URL: http://mock-erp:8010
       MOCK_ERP_INPROCESS: "false"
@@ -84,10 +130,17 @@ services:
       AUTH_MODE: token
       AUTH_SECRET: ${AUTH_SECRET:?请设置 AUTH_SECRET（例如 openssl rand -hex 32）}
       AUTH_TOKEN_TTL_SECS: ${AUTH_TOKEN_TTL_SECS:-3600}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:?请设置 CORS_ORIGINS（例如 https://auditflow.example.com）}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-20}
-    ports:
-      - "8000:8000"
+      MAX_REQUEST_MB: ${MAX_REQUEST_MB:-25}
+      RATE_LIMIT_ENABLED: "true"
+      RATE_LIMIT_BACKEND: redis
+      CASE_LOCK_BACKEND: redis
+      TRUST_PROXY_HEADERS: "true"
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # 连接池按副本数 × 并发估算，避免打满 PostgreSQL max_connections
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-20}
     depends_on:
       postgres:
         condition: service_healthy
@@ -97,6 +150,15 @@ services:
         condition: service_healthy
       mock-erp:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    logging: *default-logging
+    networks: [backend, edge]
+    mem_limit: 1g
 
   web:
     build:
@@ -105,12 +167,31 @@ services:
       args:
         VITE_API_BASE: /api
     container_name: auditflow-prod-web
+    <<: *default-restart
     ports:
-      - "8080:80"
+      - "${WEB_PORT:-8080}:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+    networks: [backend, edge]
+    mem_limit: 256m
 
 volumes:
   prod_postgres_data:
   prod_redis_data:
   prod_minio_data:
+
+networks:
+  # 数据面网络：仅容器间通信，不允许访问外网
+  backend:
+    driver: bridge
+    internal: true
+  # 入口网络：web 与 api 互通，只有 web 发布端口
+  edge:
+    driver: bridge

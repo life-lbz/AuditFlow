@@ -5,7 +5,7 @@
     python infra/smoke_test.py --base http://localhost:8080/api   # 经 nginx 反代
     python infra/smoke_test.py --base http://localhost:8000 --token <bearer>
 
-检查项：健康、请求追踪头、运行信息、制度清单、案件清单、指标端点。
+检查项：存活/就绪探针、请求追踪头、安全响应头、运行信息、制度清单、案件清单、指标端点。
 任一失败即返回非 0，可直接作为发布流水线的最后一道门禁。
 """
 
@@ -35,15 +35,33 @@ def main() -> int:
 
     with httpx.Client(base_url=base, timeout=10.0, headers=headers) as client:
         try:
-            health = client.get("/health")
+            live = client.get("/health/live")
             passed &= _check(
-                "GET /health", health.status_code == 200, f"status={health.status_code}"
+                "GET /health/live", live.status_code == 200, f"status={live.status_code}"
             )
             passed &= _check(
-                "X-Request-ID 响应头", bool(health.headers.get("X-Request-ID"))
+                "X-Request-ID 响应头", bool(live.headers.get("X-Request-ID"))
             )
-            if health.status_code != 200:
-                print("服务不可用，后续检查跳过")
+            passed &= _check(
+                "安全响应头",
+                live.headers.get("X-Content-Type-Options") == "nosniff"
+                and live.headers.get("X-Frame-Options") == "DENY",
+                "X-Content-Type-Options / X-Frame-Options",
+            )
+
+            ready = client.get("/health/ready")
+            ready_body = ready.json() if ready.status_code < 500 else {}
+            ready_ok = ready.status_code == 200 and ready_body.get("status") in {
+                "ready",
+                "degraded",
+            }
+            passed &= _check(
+                "GET /health/ready",
+                ready_ok,
+                f"status={ready.status_code} readiness={ready_body.get('status')}",
+            )
+            if not ready_ok:
+                print("服务未就绪，后续检查跳过")
                 return 1
         except httpx.HTTPError as exc:
             print(f"[FAIL] 无法连接 {base} - {exc}")
@@ -56,7 +74,8 @@ def main() -> int:
             )
 
         metrics = client.get("/metrics")
-        ok = metrics.status_code == 200 and "auditflow_" in metrics.text
+        # METRICS_TOKEN 配置后未携带 token 返回 401 也视为符合预期（端点已受保护）
+        ok = (metrics.status_code == 200 and "auditflow_" in metrics.text) or metrics.status_code == 401
         passed &= _check("GET /metrics", ok, f"status={metrics.status_code}")
 
         info = client.get("/system/info")
@@ -64,8 +83,8 @@ def main() -> int:
             payload = info.json()
             passed &= _check(
                 "系统信息字段完整",
-                {"model_provider", "storage_backend"}.issubset(payload.keys()),
-                f"keys={sorted(payload.keys())[:6]}",
+                {"model_provider", "storage_backend", "environment"}.issubset(payload.keys()),
+                f"env={payload.get('environment')} version={payload.get('version')}",
             )
 
     print("\n冒烟结果：" + ("全部通过" if passed else "存在失败项"))

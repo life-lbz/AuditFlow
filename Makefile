@@ -3,12 +3,13 @@
 
 PY ?= python
 COMPOSE := docker compose -f infra/docker-compose.yml
-COMPOSE_PROD := docker compose -f infra/docker-compose.prod.yml
+PROD_ENV ?= .env.prod
+COMPOSE_PROD := docker compose --env-file $(PROD_ENV) -f infra/docker-compose.prod.yml
 ENV_DB := postgresql+asyncpg://auditflow:auditflow@localhost:5433/auditflow
 BASE ?= http://localhost:8000
 SECRET ?= change-me-before-production
 
-.PHONY: up down ps logs dev web migrate migrate-new seed index-policies fixtures eval eval-compare demo test test-erp test-api test-state ci lint smoke prod-up prod-down clean
+.PHONY: up down ps logs dev web migrate migrate-new seed index-policies fixtures eval eval-compare demo test test-erp test-api test-state ci lint smoke prod-up prod-down prod-ps prod-logs prod-smoke backup restore docker-check audit clean
 
 ## 启动依赖（postgres/redis/minio/mock-erp）
 up:
@@ -81,12 +82,38 @@ lint:
 smoke:
 	$(PY) infra/smoke_test.py --base $(BASE)
 
-## 生产态编排（自包含镜像 + 启动前迁移）
+## 生产态编排（自包含镜像 + 启动前迁移；需先准备 .env.prod）
 prod-up:
-	AUTH_SECRET=$(SECRET) $(COMPOSE_PROD) up -d --build
+	$(COMPOSE_PROD) up -d --build
 
 prod-down:
 	$(COMPOSE_PROD) down
+
+prod-ps:
+	$(COMPOSE_PROD) ps
+
+prod-logs:
+	$(COMPOSE_PROD) logs --tail=120 -f
+
+## 生产冒烟（经 nginx 反代）
+prod-smoke:
+	$(PY) infra/smoke_test.py --base http://localhost:$${WEB_PORT:-8080}/api --token $(TOKEN)
+
+## PostgreSQL 备份 / 恢复
+backup:
+	bash infra/ops/backup.sh
+
+restore:
+	bash infra/ops/restore.sh $(file)
+
+## 本地校验生产镜像可构建（不启动）
+docker-check:
+	docker build -f infra/Dockerfile.api -t auditflow-api:local .
+	docker build -f infra/Dockerfile.web -t auditflow-web:local .
+
+## 依赖漏洞扫描
+audit:
+	$(PY) -m pip_audit || true
 
 test-state:
 	$(PY) -m pytest tests/test_state_machine.py -v

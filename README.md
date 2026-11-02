@@ -47,16 +47,19 @@
 | 前端 | React 18 · TypeScript · Vite |
 | 模型 | ModelGateway 抽象：Stub（确定性启发式）/ Remote（OpenAI 兼容） |
 | 检索 | BM25 + hashing 向量 + RRF 融合 + rerank |
-| 鉴权 | HMAC-SHA256 Token（dev/token 双模式） |
-| 观测 | Prometheus /metrics + X-Request-ID + 统一错误结构 |
-| 部署 | 生产 Dockerfile + nginx + docker-compose.prod + smoke_test |
-| CI | ruff（E9/F）+ pytest + 前端 build |
+| 鉴权 | HMAC-SHA256 Token（dev/token 双模式） + RBAC 权限矩阵 |
+| 观测 | Prometheus /metrics（可选 Bearer）+ 结构化 JSON 日志 + 请求 ID |
+| 可靠性 | 固定窗口限流 + 案件级互斥锁（Redis/内存降级） + liveness/readiness 探针 |
+| 安全 | 生产配置自检 + 安全响应头 + 上传魔数校验 + 请求体上限 |
+| 部署 | 多阶段非 root 镜像 + nginx + docker-compose.prod + 备份恢复 + smoke_test |
+| CI | ruff + pytest（含覆盖率）+ pip-audit + 前端 build + 镜像构建 |
 
 ## 工程结构
 
 ```
 packages/
   core/          数据模型 · 状态机(29 迁移) · 鉴权 · 指标 · 配置
+                 日志 · 限流 · 案件锁 · Redis 客户端 · 健康检查
   gateway/       ModelGateway 抽象 + Stub + Remote
   documents/     解析 · OCR · 字段抽取
   retrieval/     制度切分 · BM25+向量混合检索 · RRF · rerank
@@ -71,8 +74,8 @@ apps/
   api/           FastAPI 服务
   web/           React 前端（案件/审核/Trace/评测）
   mock_erp/      Mock ERP（6 种故障注入）
-infra/           Dockerfile · nginx · compose · Alembic · 种子生成
-tests/           114 项 · 内存 SQLite · 0 外部依赖
+infra/           Dockerfile · nginx · compose · Alembic · 种子生成 · ops 脚本
+tests/           123 项 · 内存 SQLite · 0 外部依赖 · 含生产基线用例
 ```
 
 ## 快速开始
@@ -120,15 +123,83 @@ python -m packages.evals.runner --mode single_agent_verifier --out data/report_c
 
 ```powershell
 ruff check .
-pytest -q       # 114 passed, 0 skip, 不需要 Docker
+pytest -q       # 123 passed, 0 skip, 不需要 Docker
 ```
 
-## 部署
+测试覆盖状态机、四组评测、API 端到端、Action Gateway、Mock ERP、规则、检索、
+权限与本次新增的生产基线（配置自检 / 探针 / 限流 / 上传校验 / 案件锁 / 指标鉴权）。
+
+## 生产部署
+
+生产形态由 `infra/docker-compose.prod.yml` 编排：PostgreSQL、Redis、MinIO 只在内部
+`backend` 网络可达，仅 nginx 通过 `edge` 网络发布 `WEB_PORT`；API 容器以非 root 运行、
+只读根文件系统，启动前自动执行 `alembic upgrade head`。
 
 ```powershell
-docker compose -f infra/docker-compose.prod.yml up -d --build
-python infra/smoke_test.py --base http://localhost:8080
+# 1. 准备生产变量（切勿提交）
+Copy-Item .env.prod.example .env.prod
+# 按注释填写 POSTGRES_PASSWORD / MINIO_SECRET_KEY / AUTH_SECRET / CORS_ORIGINS
+# 生成密钥：openssl rand -hex 24（数据库/对象存储）、openssl rand -hex 32（AUTH_SECRET）
+
+# 2. 启动（Makefile 已带 --env-file）
+make prod-up            # 等价于 docker compose --env-file .env.prod -f infra/docker-compose.prod.yml up -d --build
+make prod-ps            # 查看容器与健康状态
+make prod-logs          # 跟踪日志
+make prod-smoke         # 冒烟：liveness/readiness/安全头/指标/系统信息
+make prod-down
 ```
+
+单副本部署可使用 `RATE_LIMIT_BACKEND=memory` / `CASE_LOCK_BACKEND=memory`；**多副本必须
+改为 `redis`**，否则限流与案件串行只在单进程内生效。
+
+### 健康探针
+
+| 路径 | 用途 | 说明 |
+|---|---|---|
+| `/health` | 兼容旧探针 | 固定返回 `{status: ok, version}` |
+| `/health/live` | liveness | 仅进程存活，不触达依赖 |
+| `/health/ready` | readiness | 并行检查 database/storage/redis/erp；数据库不可用返回 503，其余降级为 `degraded` 但仍 200 |
+
+`/health/ready` 同时返回 `production_warnings()`，例如 stub 模型、local 存储、默认密钥。
+
+### 安全基线
+
+`ENVIRONMENT=production` 时启动前会做硬性自检，任一条不满足直接拒绝启动：
+
+- `AUTH_MODE` 必须为 `token`（`dev` 会信任可伪造的 `X-Role`）；
+- `AUTH_SECRET` 不得为默认值且长度 ≥ 32；
+- `CORS_ORIGINS` 不得为 `*`。
+
+运行时另有：固定窗口限流（读 120/min、写 30/min，返回 429 与 `Retry-After`）、
+请求体上限 413、扩展名白名单 + 文件头魔数校验、`X-Content-Type-Options` /
+`X-Frame-Options` / `Referrer-Policy` / `Permissions-Policy` 安全头、
+`/metrics` 可选 Bearer 鉴权、nginx CSP 与 `server_tokens off`。
+
+### 日志与指标
+
+- `LOG_FORMAT=json` 输出结构化日志，字段含 `request_id/method/path/status/duration_ms`，
+  可用 `request_id`（响应头 `X-Request-ID`）串起单次请求；
+- `/metrics` 为 Prometheus 文本格式，生产可通过 `METRICS_TOKEN` 限制抓取；
+- 容器日志按 10MB / 3 份轮转，`restart: unless-stopped`。
+
+### 备份与恢复
+
+```powershell
+# 数据库（pg_dump -Fc + sha256，默认保留 14 天）
+bash infra/ops/backup.sh
+# 恢复（--clean --if-exists，FORCE=1 跳过确认）
+bash infra/ops/restore.sh backups/postgres_20261102_030000.dump
+```
+
+MinIO 证据文件需按对象存储自身策略单独备份，脚本注释中已说明。
+
+### 上线前检查清单
+
+- [ ] `.env.prod` 四项必填值已替换，且未提交到版本库
+- [ ] `make prod-up` 后 `make prod-ps` 全部 `healthy`
+- [ ] `make prod-smoke` 全绿
+- [ ] `GET /health/ready` 无 `production_warnings`
+- [ ] 备份脚本已加入定时任务并验证过一次恢复
 
 ## 设计取舍
 

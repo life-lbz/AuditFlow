@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.auth import create_token
 from packages.core.config import get_settings
 from packages.core.db import get_session
+from packages.core.health import run_readiness
 from packages.core.metrics import render as render_metrics
 from packages.core.models import Case, CaseStatus, ErpTransaction, PolicyChunk, TraceEvent
 from packages.core.state_machine import TERMINAL_STATES
@@ -49,7 +50,31 @@ async def issue_token(payload: TokenRequest) -> dict[str, Any]:
 
 @router.get("/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok"}
+    """兼容端点：只表示进程存活，不检查下游依赖。"""
+    settings = get_settings()
+    return {"status": "ok", "version": settings.app_version}
+
+
+@router.get("/health/live")
+async def health_live() -> dict[str, Any]:
+    """Kubernetes liveness：进程存活即返回 200，绝不因下游抖动导致重启。"""
+    return {"status": "alive"}
+
+
+@router.get("/health/ready")
+async def health_ready(
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Kubernetes readiness：检查数据库/对象存储/Redis/ERP。
+
+    database 不可用时返回 503（无法受理业务）；其余依赖失败返回 200 + degraded，
+    等依赖恢复后自动转 ready。
+    """
+    report = await run_readiness(session)
+    if report["status"] == "unavailable":
+        response.status_code = 503
+    return report
 
 
 @router.get("/system/info")
@@ -63,6 +88,8 @@ async def system_info(session: AsyncSession = Depends(get_session)) -> dict[str,
     policy_count = (await session.execute(select(func.count(PolicyChunk.id)))).scalar() or 0
 
     return {
+        "version": settings.app_version,
+        "environment": settings.environment,
         "model_provider": settings.model_provider,
         "storage_backend": settings.storage_backend,
         "mock_erp_url": settings.mock_erp_url,
@@ -105,8 +132,21 @@ async def erp_health() -> dict[str, Any]:
 
 
 @router.get("/metrics", response_class=PlainTextResponse)
-async def metrics(session: AsyncSession = Depends(get_session)) -> str:
-    """Prometheus 文本指标：进程内 HTTP 指标 + 数据库业务指标。"""
+async def metrics(
+    session: AsyncSession = Depends(get_session),
+    authorization: str | None = Header(default=None),
+) -> str:
+    """Prometheus 文本指标：进程内 HTTP 指标 + 数据库业务指标。
+
+    METRICS_TOKEN 非空时要求 Bearer 校验，避免指标端点暴露业务规模。
+    """
+    settings = get_settings()
+    if settings.metrics_token and authorization != f"Bearer {settings.metrics_token}":
+        raise HTTPException(
+            status_code=401,
+            detail="指标端点需要授权",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     status_rows = (
         await session.execute(select(Case.status, func.count(Case.id)).group_by(Case.status))
     ).all()

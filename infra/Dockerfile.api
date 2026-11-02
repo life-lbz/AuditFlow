@@ -1,13 +1,13 @@
-FROM docker.m.daocloud.io/library/python:3.12-slim
+# 生产 API 镜像：多阶段构建 + 非 root 运行 + 启动前自动迁移
+ARG PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+FROM ${PYTHON_IMAGE} AS builder
+
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
-# 依赖描述与源码一起复制，保证可执行 `pip install -e .` 后镜像自包含
 COPY pyproject.toml ./
 COPY packages ./packages
 COPY apps ./apps
@@ -15,12 +15,34 @@ COPY infra ./infra
 COPY alembic.ini ./
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -e .
+    && pip install --no-cache-dir --prefix=/install -e .
+
+
+FROM ${PYTHON_IMAGE}
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# 非 root 运行，降低容器逃逸后的影响面
+RUN groupadd --system --gid 1001 app \
+    && useradd --system --uid 1001 --gid app --home /app app
+
+COPY --from=builder /install /usr/local
+COPY --chown=app:app packages ./packages
+COPY --chown=app:app apps ./apps
+COPY --chown=app:app infra ./infra
+COPY --chown=app:app alembic.ini ./
+RUN mkdir -p data && chown -R app:app /app
+
+USER app
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=5 \
-    CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=5 \
+    CMD python -c "import urllib.request;urllib.request.urlopen('http://localhost:8000/health/live')"
 
-# 启动前执行数据库迁移，避免「服务已起、表未建」
-CMD ["bash", "-c", "alembic upgrade head && uvicorn apps.api.main:app --host 0.0.0.0 --port 8000"]
+# 启动前执行数据库迁移，避免「服务已起、表未建」；--no-access-log 由应用中间件输出结构化日志
+CMD ["sh", "-c", "alembic upgrade head && uvicorn apps.api.main:app --host 0.0.0.0 --port 8000 --no-access-log --proxy-headers --forwarded-allow-ips='*'"]

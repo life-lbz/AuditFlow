@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.config import get_settings
+from packages.core.locks import case_lock
 from packages.core.models import Case, CaseStatus, Document
 from packages.core.permissions import Action
 from packages.core.state_machine import CaseEvent, GuardFailedError, TransitionError, transition
@@ -17,6 +18,7 @@ from packages.core.storage import get_storage
 from packages.core.tracing import EVENT_CASE_CREATED, emit_trace, list_trace
 from packages.documents.parser import DocumentParseError
 from packages.documents.service import ingest_document
+from packages.documents.validation import DocumentValidationError, safe_filename, validate_upload
 from packages.gateway.factory import get_gateway
 from packages.orchestrator.orchestrator import CaseOrchestrator
 
@@ -27,8 +29,6 @@ from packages.core.db import get_session
 from packages.core.tracing import new_id
 
 router = APIRouter(tags=["cases"])
-
-_ALLOWED_UPLOAD_EXT = {".txt", ".md", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
 
 
 async def _get_case(session: AsyncSession, case_id: str) -> Case:
@@ -122,9 +122,9 @@ async def upload_document(
     if role.value == "employee" and case.employee_id != user_id:
         raise HTTPException(status_code=403, detail="无权向他人案件上传材料")
 
-    filename = file.filename or "upload.bin"
+    filename = safe_filename(file.filename)
     suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if suffix not in _ALLOWED_UPLOAD_EXT:
+    if suffix not in {".txt", ".md", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}:
         raise HTTPException(status_code=400, detail=f"不支持的文档格式: {suffix or '(无扩展名)'}")
 
     settings = get_settings()
@@ -142,6 +142,10 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="文件内容为空")
     if len(data) > max_bytes:
         raise HTTPException(status_code=413, detail=f"文件超过 {settings.max_upload_mb}MB 限制")
+    try:
+        validate_upload(filename, data)
+    except DocumentValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         result = await ingest_document(
             session,
@@ -213,7 +217,13 @@ async def get_page_image(
         content = await get_storage().get(page.image_key)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"读取图片失败: {exc}") from exc
-    media_type = "image/png" if page.image_key.lower().endswith(".png") else "application/octet-stream"
+    media_type = "application/octet-stream"
+    if content[:8].startswith(b"\x89PNG"):
+        media_type = "image/png"
+    elif content[:2] == b"\xff\xd8":
+        media_type = "image/jpeg"
+    elif content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        media_type = "image/webp"
     return Response(content=content, media_type=media_type)
 
 
@@ -237,8 +247,10 @@ async def run_case(
         raise HTTPException(status_code=409, detail="案件正在执行 ERP，请稍后查询")
 
     options = payload or RunRequest()
-    orchestrator = CaseOrchestrator(session, get_gateway(), mode=options.mode, actor=user_id)
-    result = await orchestrator.run(case_id, auto_submit=options.auto_submit)
+    # 同一案件串行编排：多副本部署时由 Redis 锁保证，单副本降级为进程内锁
+    async with case_lock(case_id):
+        orchestrator = CaseOrchestrator(session, get_gateway(), mode=options.mode, actor=user_id)
+        result = await orchestrator.run(case_id, auto_submit=options.auto_submit)
 
     return RunResponse(
         case_id=case_id,
@@ -299,8 +311,9 @@ async def retry_case(
         raise HTTPException(status_code=409, detail=f"当前状态 {case.status} 不支持重试")
 
     options = payload or RunRequest()
-    orchestrator = CaseOrchestrator(session, get_gateway(), mode=options.mode, actor=user_id)
-    result = await orchestrator.run(case_id, auto_submit=options.auto_submit)
+    async with case_lock(case_id):
+        orchestrator = CaseOrchestrator(session, get_gateway(), mode=options.mode, actor=user_id)
+        result = await orchestrator.run(case_id, auto_submit=options.auto_submit)
     return RunResponse(
         case_id=case_id,
         status=result.status,

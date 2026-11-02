@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.db import get_session
+from packages.core.locks import case_lock
 from packages.core.models import Approval, Case, CaseStatus
 from packages.core.permissions import Action
 from packages.core.state_machine import (
@@ -145,12 +146,13 @@ async def submit_approval(
         "detail": "",
     }
 
-    # 批准后立即执行 ERP（文档 §13.3「批准并提交 ERP」）
+    # 批准后立即执行 ERP（文档 §13.3「批准并提交 ERP」）；锁住案件避免与 run/retry 并发
     if payload.action == "approve":
-        orchestrator = CaseOrchestrator(session, get_gateway(), actor=user_id)
-        run = await orchestrator.execute_after_approval(
-            case_id, approved_by=user_id, auto_submit=True
-        )
+        async with case_lock(case_id):
+            orchestrator = CaseOrchestrator(session, get_gateway(), actor=user_id)
+            run = await orchestrator.execute_after_approval(
+                case_id, approved_by=user_id, auto_submit=True
+            )
         await session.refresh(case)
         result.update(
             {

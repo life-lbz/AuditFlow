@@ -1,0 +1,22 @@
+# 构建上下文排除项：减小镜像体积，避免把本地数据、密钥与缓存打进生产镜像
+.git
+.gitignore
+.github
+.vscode
+.venv
+venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/*.egg-info
+data
+apps/web/node_modules
+apps/web/dist
+backups
+.env
+.env.*
+!.env.prod.example
+Dockerfile*
+docker-compose*.yml
+*.md
