@@ -5,9 +5,7 @@ PY ?= python
 COMPOSE := docker compose -f infra/docker-compose.yml
 PROD_ENV ?= .env.prod
 COMPOSE_PROD := docker compose --env-file $(PROD_ENV) -f infra/docker-compose.prod.yml
-ENV_DB := postgresql+asyncpg://auditflow:auditflow@localhost:5433/auditflow
 BASE ?= http://localhost:8000
-SECRET ?= change-me-before-production
 
 .PHONY: up down ps logs dev web migrate migrate-new seed index-policies fixtures eval eval-compare demo test test-erp test-api test-state ci lint smoke prod-up prod-down prod-ps prod-logs prod-smoke backup restore docker-check audit clean
 

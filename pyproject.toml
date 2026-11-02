@@ -39,7 +39,7 @@ dev = [
 [tool.ruff]
 target-version = "py312"
 line-length = 110
-exclude = ["data", "apps/web", ".venv", "alembic/versions"]
+exclude = ["data", "apps/web", ".venv", "infra/migrations/versions"]
 
 [tool.ruff.lint]
 # 门禁只拦「确定是错误」的规则：语法错误 + 未定义名 + 未使用导入/变量。
