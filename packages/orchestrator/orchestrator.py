@@ -410,10 +410,19 @@ class CaseOrchestrator:
         evidence_by_field: dict[str, str] = {}
         doc_by_id = {d.id: d for d in docs}
 
+        # 字段级证据沿用抽取阶段写入的页码与像素 bbox，供前端在页面原图上框选定位
+        field_rows = (
+            await self.session.execute(
+                select(ExtractedField).where(ExtractedField.document_id.in_(list(cf.by_document)))
+            )
+        ).scalars().all()
+        field_meta = {(row.document_id, row.field_name): row for row in field_rows}
+
         for doc_id, fields in cf.by_document.items():
             doc = doc_by_id.get(doc_id)
             source_type = doc.type if doc else "document"
             for name, value in fields.items():
+                meta = field_meta.get((doc_id, name))
                 ev_id = new_id("ev")
                 quote = f"{FIELD_LABELS.get(name, name)}：{value}"
                 self.session.add(
@@ -422,8 +431,8 @@ class CaseOrchestrator:
                         case_id=case.id,
                         source_type=source_type,
                         source_id=doc_id,
-                        page_no=1,
-                        bbox=None,
+                        page_no=(meta.page_no if meta and meta.page_no else 1),
+                        bbox=meta.bbox if meta else None,
                         quote=quote,
                         score=cf.confidences.get(name, 0.0),
                         document_version="v1",

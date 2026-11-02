@@ -227,45 +227,10 @@ def render_approval_email(
 
 
 def text_to_png(text: str, width: int = 900) -> bytes:
-    """把文本渲染为白底黑字 PNG。缺少 Pillow 时返回空字节。"""
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError:
-        return b""
+    """把文本渲染为白底黑字 PNG（版式定义与 bbox 定位共用 documents.layout）。"""
+    from packages.documents.layout import render_text_png
 
-    font = _load_font()
-    line_height = 26 if font else 16
-    lines = text.splitlines() or [""]
-    height = max(200, 24 + line_height * len(lines))
-    image = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(image)
-
-    y = 12
-    for line in lines:
-        draw.text((16, y), line, fill="black", font=font)
-        y += line_height
-
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def _load_font():
-    try:
-        from PIL import ImageFont
-    except ImportError:
-        return None
-    for candidate in (
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simsun.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ):
-        try:
-            return ImageFont.truetype(candidate, 18)
-        except (OSError, IOError):
-            continue
-    return None
+    return render_text_png(text, width)
 
 
 # ---------------------------------------------------------------------------

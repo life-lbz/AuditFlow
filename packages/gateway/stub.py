@@ -18,6 +18,7 @@ import re
 import time
 from typing import Any
 
+from ..documents.layout import locate_bbox
 from .base import (
     AgentAction,
     DocumentType,
@@ -54,6 +55,47 @@ _NIGHTS_RE = re.compile(r"(\d+)\s*晚")
 _ATTENDEES_RE = re.compile(r"(\d+)\s*人")
 _TRIP_START_RE = re.compile(r"出差开始日期\s*[:：]?\s*(20\d{2}[-/年]\d{1,2}[-/月]\d{1,2}日?)")
 _TRIP_END_RE = re.compile(r"出差结束日期\s*[:：]?\s*(20\d{2}[-/年]\d{1,2}[-/月]\d{1,2}日?)")
+
+# 字段 → 定位用正则：抽取后据此回查命中的原始文本区间，换算像素 bbox
+_LOCATORS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "amount": (_AMOUNT_RE, _AMOUNT_LOOSE_RE),
+    "date": (_DATE_RE, _DATETIME_RE),
+    "invoice_no": (_INVOICE_NO_RE,),
+    "vendor": (_VENDOR_RE,),
+    "tax_no": (_TAX_NO_RE,),
+    "title": (_TITLE_RE,),
+    "category": (_CATEGORY_RE,),
+    "nights": (_NIGHTS_RE,),
+    "attendees": (_ATTENDEES_RE,),
+    "merchant": (_VENDOR_RE,),
+    "payment_method": (_PAYMENT_RE,),
+    "transaction_time": (_DATETIME_RE, _DATE_RE),
+    "counterparty": (_VENDOR_RE,),
+    "transaction_no": (_TXN_NO_RE,),
+    "approver": (_APPROVER_RE,),
+    "approval_result": (_APPROVAL_RESULT_RE,),
+    "approved_at": (_DATE_RE,),
+    "reason": (_APPROVAL_REASON_RE,),
+    "trip_start": (_TRIP_START_RE,),
+    "trip_end": (_TRIP_END_RE,),
+}
+
+
+def _same_value(raw: str, value: Any) -> bool:
+    if isinstance(value, (int, float)):
+        num = _to_float(raw)
+        return num is not None and abs(num - float(value)) < 1e-6
+    return raw.strip() == str(value).strip()
+
+
+def _locate_span(text: str, field_name: str, value: Any) -> tuple[int, int] | None:
+    """在页文本中定位字段取值，返回字符区间；定位不到返回 None。"""
+    for pattern in _LOCATORS.get(field_name, ()):
+        for match in pattern.finditer(text):
+            if _same_value(match.group(1), value):
+                return match.start(1), match.end(1)
+    return None
+
 
 # OCR 退化标记：合成数据在退化样本中注入，stub 据此下调置信度（文档 §7.4 双重校验思想）
 _DEGRADE_MARKERS = ("[OCR_LOW_QUALITY]", "[BLUR]", "[PARTIAL]")
@@ -119,10 +161,11 @@ class StubModelGateway(ModelGateway):
             self._extract_approval(cleaned, fields)
 
         confidence_scale = 0.6 if degraded else 1.0
-        for f in fields.values():
+        for name, f in fields.items():
             f.confidence = round(min(1.0, f.confidence * confidence_scale), 4)
             if degraded:
                 f.source = "fused-low"
+            self._attach_bbox(request.pages or [], name, f)
 
         evidence = [
             {
@@ -153,6 +196,19 @@ class StubModelGateway(ModelGateway):
             degraded=degraded,
             error=None if fields else "no_fields_extracted",
         )
+
+    @staticmethod
+    def _attach_bbox(pages: list[str], field_name: str, f: ExtractionField) -> None:
+        """把字段取值换算为页面像素 bbox（stub 的「视觉定位」替身）。"""
+        for index, page_text in enumerate(pages, start=1):
+            span = _locate_span(page_text, field_name, f.value)
+            if span is None:
+                continue
+            box = locate_bbox(page_text, span[0], span[1])
+            if box:
+                f.page_no = index
+                f.bbox = box
+            return
 
     def _extract_common_billing(
         self, text: str, fields: dict[str, ExtractionField], doc_type: DocumentType

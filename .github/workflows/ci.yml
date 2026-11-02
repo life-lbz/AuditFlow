@@ -5,6 +5,13 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   backend:
     runs-on: ubuntu-latest
@@ -22,11 +29,17 @@ jobs:
       - name: 静态检查（未定义名 / 未使用导入 / 语法）
         run: ruff check .
 
+      - name: 依赖漏洞扫描（不阻断，结果供人工评估）
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          pip-audit
+
       - name: 生成合成票据（若仓库未携带）
         run: python -m infra.seed.run fixtures
 
       - name: 单元与集成测试（内存 SQLite + 进程内 Mock ERP）
-        run: pytest -q
+        run: pytest -q --cov=packages --cov=apps --cov-report=term-missing
 
   frontend:
     runs-on: ubuntu-latest
@@ -47,3 +60,20 @@ jobs:
 
       - name: 类型检查 + 生产构建
         run: npm run build
+
+      - name: 单元测试（Vitest + Testing Library）
+        run: npm test
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建 API 生产镜像
+        run: docker build -f infra/Dockerfile.api -t auditflow-api:ci .
+
+      - name: 构建 Web 生产镜像
+        run: docker build -f infra/Dockerfile.web -t auditflow-web:ci .

@@ -15,7 +15,7 @@ import asyncio
 import json
 import sys
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from packages.core.models import Case, EvalCase
 from packages.core.config import get_settings
@@ -147,25 +147,125 @@ async def create_demo_case(case_id: str | None = None, *, keep_open: bool = Fals
             txt_path = case_dir / doc["filename"]
             if not txt_path.exists():
                 continue
-            await ingest_document(
-                session,
-                gateway,
-                case_id=target_id,
-                filename=doc["filename"],
-                data=txt_path.read_bytes(),
-                declared_type=doc["type"],
-            )
+            png_path = txt_path.with_suffix(".png")
+            if png_path.exists():
+                # 以图片作为原件入站、文本作为 OCR sidecar，页面原图才能在证据查看器中展示
+                await ingest_document(
+                    session,
+                    gateway,
+                    case_id=target_id,
+                    filename=png_path.name,
+                    data=png_path.read_bytes(),
+                    declared_type=doc["type"],
+                    sidecar_text=txt_path.read_text(encoding="utf-8"),
+                )
+            else:
+                await ingest_document(
+                    session,
+                    gateway,
+                    case_id=target_id,
+                    filename=doc["filename"],
+                    data=txt_path.read_bytes(),
+                    declared_type=doc["type"],
+                )
         await session.commit()
 
     print(f"[demo] 案件 {target_id} 已创建，文档 {len(spec['documents'])} 份")
     return target_id
 
 
+async def backfill_evidence() -> None:
+    """为已有文档补齐页面原图与字段/证据 bbox（本地演示数据修复）。
+
+    仅用于早于 bbox 落地的历史数据；新案件在入库时已自动带坐标。
+    """
+    from packages.core.models import Document, DocumentPage, Evidence, ExtractedField
+    from packages.core.storage import get_storage
+    from packages.documents.layout import render_text_png
+    from packages.documents.schema import FIELD_LABELS
+    from packages.gateway.base import DocumentType, ExtractionRequest
+    from packages.gateway.stub import StubModelGateway
+
+    gateway = StubModelGateway()
+    storage = get_storage()
+    await storage.ensure_ready()
+    label_to_field = {label: name for name, label in FIELD_LABELS.items()}
+    pages_updated = fields_updated = evidence_updated = 0
+
+    async with SessionLocal() as session:
+        docs = (await session.execute(select(Document))).scalars().all()
+        for doc in docs:
+            pages = (
+                await session.execute(
+                    select(DocumentPage)
+                    .where(DocumentPage.document_id == doc.id)
+                    .order_by(DocumentPage.page_no)
+                )
+            ).scalars().all()
+            for page in pages:
+                if not page.image_key and page.ocr_text.strip():
+                    png = render_text_png(page.ocr_text)
+                    if png:
+                        key = f"{doc.storage_key}#page{page.page_no}"
+                        await storage.put(key, png, "image/png")
+                        page.image_key = key
+                        pages_updated += 1
+            if not pages:
+                continue
+
+            try:
+                doc_type = DocumentType(doc.type)
+            except ValueError:
+                doc_type = DocumentType.UNKNOWN
+            result = await gateway.extract_structured(
+                ExtractionRequest(
+                    document_type=doc_type,
+                    pages=[p.ocr_text for p in pages],
+                )
+            )
+            rows = (
+                await session.execute(
+                    select(ExtractedField).where(ExtractedField.document_id == doc.id)
+                )
+            ).scalars().all()
+            by_name = {row.field_name: row for row in rows}
+            for name, field in result.fields.items():
+                row = by_name.get(name)
+                if row is None or not field.bbox:
+                    continue
+                row.bbox = field.bbox
+                row.page_no = field.page_no
+                fields_updated += 1
+
+            evidence_rows = (
+                await session.execute(
+                    select(Evidence).where(
+                        Evidence.source_id == doc.id, Evidence.source_type != "policy"
+                    )
+                )
+            ).scalars().all()
+            for ev in evidence_rows:
+                label = ev.quote.split("：", 1)[0]
+                name = label_to_field.get(label) or (label if label in by_name else "")
+                row = by_name.get(name)
+                if row is None or not row.bbox:
+                    continue
+                ev.bbox = row.bbox
+                ev.page_no = row.page_no or 1
+                evidence_updated += 1
+        await session.commit()
+
+    print(
+        f"[backfill] 页面原图 {pages_updated} 张，字段 bbox {fields_updated} 条，"
+        f"证据 bbox {evidence_updated} 条"
+    )
+
+
 async def main_async(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="AuditFlow 种子数据")
     parser.add_argument(
         "command",
-        choices=["all", "policies", "fixtures", "evals", "demo-case"],
+        choices=["all", "policies", "fixtures", "evals", "demo-case", "backfill"],
         help="要执行的步骤",
     )
     parser.add_argument("--case-id", default=None, help="demo-case 时指定案件 ID")
@@ -185,6 +285,8 @@ async def main_async(argv: list[str]) -> int:
             await seed_eval_cases()
     if args.command == "demo-case":
         await create_demo_case(args.case_id)
+    if args.command == "backfill":
+        await backfill_evidence()
     return 0
 
 
