@@ -22,9 +22,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from packages.core.config import get_settings
-from packages.core.db import engine
+from packages.core.db import close_engine
 from packages.core.locks import LockBusy
-from packages.core.logging import configure_logging
+from packages.core.logging import configure_logging, set_request_id
 from packages.core.metrics import registry as metrics_registry
 from packages.core.permissions import PermissionDenied
 from packages.core.ratelimit import limiter
@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     await close_redis()
-    await engine.dispose()
+    await close_engine()
     logger.info("AuditFlow API stopped")
 
 
@@ -123,6 +123,7 @@ def create_app() -> FastAPI:
         incoming_id = request.headers.get("X-Request-ID") or ""
         request_id = incoming_id if _REQUEST_ID_PATTERN.match(incoming_id) else new_id("req")
         request.state.request_id = request_id
+        set_request_id(request_id)
         headers = _security_headers(settings)
 
         # 1) 请求体上限（chunked 请求由 nginx client_max_body_size 兜底）

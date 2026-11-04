@@ -1,5 +1,8 @@
 # 生产 API 镜像：多阶段构建 + 非 root 运行 + 启动前自动迁移
-ARG PYTHON_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
+# IMAGE_BASE 允许海外部署时覆盖为官方源，例如：
+#   docker build --build-arg IMAGE_BASE=library -t auditflow-api .
+ARG IMAGE_BASE=docker.m.daocloud.io/library
+ARG PYTHON_IMAGE=${IMAGE_BASE}/python:3.12-slim
 
 FROM ${PYTHON_IMAGE} AS builder
 

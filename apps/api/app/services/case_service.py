@@ -13,34 +13,69 @@ from packages.core.models import (
     Check,
     Decision,
     Document,
-    DocumentPage,
     ErpTransaction,
     Evidence,
-    ExtractedField,
 )
 from packages.core.state_machine import TERMINAL_STATES, allowed_events
 from packages.documents.schema import DOCUMENT_TYPE_LABELS, FIELD_LABELS, REQUIRED_DOCUMENTS
 
 
 async def build_case_detail(session: AsyncSession, case: Case) -> dict[str, Any]:
-    """聚合案件详情（文档 §15.2：字段、证据、规则、决策、审批、ERP 一次返回）。"""
+    """聚合案件详情（文档 §15.2：字段、证据、规则、决策、审批、ERP 一次返回）。
+
+    数据库查询次数：1 次 Document（带 selectin 预取 pages + extracted_fields）
+    + 1 次 Evidence + 1 次 Check + 1 次 Decision + 1 次 Approval + 1 次 ErpTransaction
+    = 6 次；原实现在每个 document 上循环查 pages + fields，文档数 N 时为 2 + 3N + 2。
+    """
     docs = (
         await session.execute(
-            select(Document).where(Document.case_id == case.id).order_by(Document.created_at)
+            select(Document)
+            .where(Document.case_id == case.id)
+            .order_by(Document.created_at)
         )
     ).scalars().all()
+
+    evidence_all = (
+        await session.execute(
+            select(Evidence).where(Evidence.case_id == case.id)
+        )
+    ).scalars().all()
+    evidence_rows = [e for e in evidence_all if e.source_type != "policy"]
+    policy_rows = [e for e in evidence_all if e.source_type == "policy"]
+
+    checks = (
+        await session.execute(
+            select(Check).where(Check.case_id == case.id).order_by(Check.created_at)
+        )
+    ).scalars().all()
+
+    decision = (
+        await session.execute(
+            select(Decision)
+            .where(Decision.case_id == case.id)
+            .order_by(Decision.created_at.desc())
+        )
+    ).scalars().first()
+
+    approvals = (
+        await session.execute(
+            select(Approval)
+            .where(Approval.case_id == case.id)
+            .order_by(Approval.created_at)
+        )
+    ).scalars().all()
+
+    erp_txn = (
+        await session.execute(
+            select(ErpTransaction)
+            .where(ErpTransaction.case_id == case.id)
+            .order_by(ErpTransaction.created_at.desc())
+        )
+    ).scalars().first()
 
     document_items: list[dict[str, Any]] = []
     extracted: dict[str, Any] = {}
     for doc in docs:
-        pages = (
-            await session.execute(
-                select(DocumentPage).where(DocumentPage.document_id == doc.id).order_by(DocumentPage.page_no)
-            )
-        ).scalars().all()
-        fields = (
-            await session.execute(select(ExtractedField).where(ExtractedField.document_id == doc.id))
-        ).scalars().all()
         document_items.append(
             {
                 "id": doc.id,
@@ -59,7 +94,7 @@ async def build_case_detail(session: AsyncSession, case: Case) -> dict[str, Any]
                         if p.image_key
                         else None,
                     }
-                    for p in pages
+                    for p in doc.pages
                 ],
                 "fields": [
                     {
@@ -70,11 +105,11 @@ async def build_case_detail(session: AsyncSession, case: Case) -> dict[str, Any]
                         "page_no": f.page_no,
                         "bbox": f.bbox,
                     }
-                    for f in fields
+                    for f in doc.extracted_fields
                 ],
             }
         )
-        for f in fields:
+        for f in doc.extracted_fields:
             extracted.setdefault(
                 f.field_name,
                 {
@@ -84,43 +119,6 @@ async def build_case_detail(session: AsyncSession, case: Case) -> dict[str, Any]
                     "document_id": doc.id,
                 },
             )
-
-    evidence_rows = (
-        await session.execute(
-            select(Evidence).where(Evidence.case_id == case.id, Evidence.source_type != "policy")
-        )
-    ).scalars().all()
-    policy_rows = (
-        await session.execute(
-            select(Evidence).where(Evidence.case_id == case.id, Evidence.source_type == "policy")
-        )
-    ).scalars().all()
-
-    checks = (
-        await session.execute(
-            select(Check).where(Check.case_id == case.id).order_by(Check.created_at)
-        )
-    ).scalars().all()
-
-    decision = (
-        await session.execute(
-            select(Decision).where(Decision.case_id == case.id).order_by(Decision.created_at.desc())
-        )
-    ).scalars().first()
-
-    approvals = (
-        await session.execute(
-            select(Approval).where(Approval.case_id == case.id).order_by(Approval.created_at)
-        )
-    ).scalars().all()
-
-    erp_txn = (
-        await session.execute(
-            select(ErpTransaction)
-            .where(ErpTransaction.case_id == case.id)
-            .order_by(ErpTransaction.created_at.desc())
-        )
-    ).scalars().first()
 
     present_types = {d.type for d in docs}
     missing_documents = [

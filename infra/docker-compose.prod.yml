@@ -76,22 +76,6 @@ services:
     networks: [backend]
     mem_limit: 512m
 
-  # 演示/联调用 Mock ERP；接入真实 ERP 时应替换为真实系统并删除该服务
-  mock-erp:
-    build:
-      context: ..
-      dockerfile: infra/Dockerfile.mock-erp
-    container_name: auditflow-prod-mock-erp
-    <<: *default-restart
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8010/admin/state')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-    logging: *default-logging
-    networks: [backend]
-    mem_limit: 256m
-
   api:
     build:
       context: ..
@@ -120,7 +104,8 @@ services:
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?请设置 MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET:-auditflow-docs}
       STORAGE_BACKEND: minio
-      MOCK_ERP_URL: http://mock-erp:8010
+      # 接入真实 ERP 时在此填写；未填时应用会把 ERP 调用标记为 degraded（不阻断流程）
+      MOCK_ERP_URL: ${MOCK_ERP_URL:-}
       MOCK_ERP_INPROCESS: "false"
       MODEL_PROVIDER: ${MODEL_PROVIDER:-stub}
       MODEL_BASE_URL: ${MODEL_BASE_URL:-}
@@ -147,8 +132,6 @@ services:
       redis:
         condition: service_healthy
       minio:
-        condition: service_healthy
-      mock-erp:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health/ready')"]

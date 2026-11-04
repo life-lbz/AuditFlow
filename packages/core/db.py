@@ -2,6 +2,9 @@
 
 生产环境启用连接池参数与连接前探活（pool_pre_ping），避免长连接被中间设备断开后
 第一个请求必然失败；池大小可通过 DB_POOL_SIZE / DB_MAX_OVERFLOW 调整。
+
+engine 与 SessionLocal 在首次使用时才创建，避免 Alembic 执行期间 import 本模块
+拿到过期 DATABASE_URL（Alembic env.py 自己 build engine）。
 """
 
 from __future__ import annotations
@@ -9,7 +12,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from .config import get_settings
@@ -22,12 +25,11 @@ def get_database_url() -> str:
     return os.environ.get("DATABASE_URL", DEFAULT_URL)
 
 
-def create_engine(url: str | None = None):
+def _build_engine(url: str | None = None) -> AsyncEngine:
     target = url or get_database_url()
     settings = get_settings()
     kwargs: dict = {"echo": False}
     if target.startswith("sqlite"):
-        # 内存 SQLite 需要共享连接池，否则每个连接看到的是不同数据库
         kwargs["poolclass"] = StaticPool
         kwargs["connect_args"] = {"check_same_thread": False}
     else:
@@ -42,12 +44,36 @@ def create_engine(url: str | None = None):
     return create_async_engine(target, **kwargs)
 
 
-engine = create_engine()
-SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+# ---- lazy module-level state ----
+_engine: AsyncEngine | None = None
+_session_local: async_sessionmaker[AsyncSession] | None = None
+
+
+def _ensure_engine() -> AsyncEngine:
+    global _engine, _session_local
+    if _engine is None:
+        _engine = _build_engine()
+        _session_local = async_sessionmaker(
+            _engine, class_=AsyncSession, expire_on_commit=False
+        )
+    return _engine
+
+
+async def close_engine() -> None:
+    """关闭引擎并释放连接池（应用优雅关闭时调用）。"""
+    global _engine, _session_local
+    if _engine is not None:
+        await _engine.dispose()
+    _engine = None
+    _session_local = None
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    async with SessionLocal() as session:
+    """FastAPI 依赖：每次请求独立会话，异常自动回滚。"""
+    maker = _ensure_engine()  # noqa: F841 - 触发初始化，真正用的是模块级 _session_local
+    # maker 变量只是为了触发上面的 assert
+    assert _session_local is not None
+    async with _session_local() as session:
         try:
             yield session
         except Exception:
@@ -57,5 +83,16 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 async def init_db() -> None:
     """开发环境建表（生产环境走 Alembic 迁移）。"""
+    engine = _ensure_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+# 向后兼容：允许 `from packages.core.db import engine, SessionLocal`
+def __getattr__(name: str):  # noqa: D401 - 模块级钩子
+    if name == "engine":
+        return _ensure_engine()
+    if name == "SessionLocal":
+        _ensure_engine()
+        return _session_local
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

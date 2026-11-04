@@ -15,6 +15,7 @@ concurrency:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    # 仅在 sqlite 上跑单元测试；PG+Redis 集成用单独的 integration job（见下）
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +41,58 @@ jobs:
 
       - name: 单元与集成测试（内存 SQLite + 进程内 Mock ERP）
         run: pytest -q --cov=packages --cov=apps --cov-report=term-missing
+
+  backend-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 真实 PostgreSQL + Redis，跑 Alembic migration + 冒烟测试，防止方言/pool/migration 问题漏进主分支
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_USER: auditflow
+          POSTGRES_DB: auditflow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd redis-cli ping
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://auditflow:testpass@localhost:5432/auditflow
+      REDIS_URL: redis://localhost:6379/0
+      STORAGE_BACKEND: local
+      MOCK_ERP_INPROCESS: "true"
+      RATE_LIMIT_ENABLED: "false"
+      CASE_LOCK_BACKEND: memory
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -e ".[dev]"
+
+      - name: 执行 Alembic 迁移（真实 PG）
+        run: python -m alembic upgrade head
+
+      - name: 生成合成票据
+        run: python -m infra.seed.run fixtures
+
+      - name: 跑 pytest 验证迁移后的 schema
+        run: pytest -q
 
   frontend:
     runs-on: ubuntu-latest

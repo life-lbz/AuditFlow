@@ -103,6 +103,9 @@ async def load_case_fields(session: AsyncSession, case_id: str) -> CaseFields:
 
     同一字段在多个文档出现时（如发票金额与流水金额），以第一个出现的值为准，
     并记录每个文档各自的字段集，供规则引擎做交叉比对。
+
+    Document.extracted_fields 已通过 selectin 懒加载配置随主查询一并拉取，
+    此处无需额外 per-doc 查询（原实现有 N+1）。
     """
     docs = (
         await session.execute(select(Document).where(Document.case_id == case_id))
@@ -110,20 +113,15 @@ async def load_case_fields(session: AsyncSession, case_id: str) -> CaseFields:
 
     cf = CaseFields()
     for doc in docs:
-        rows = (
-            await session.execute(
-                select(ExtractedField).where(ExtractedField.document_id == doc.id)
-            )
-        ).scalars().all()
         per_doc: dict[str, Any] = {}
-        for row in rows:
+        for row in doc.extracted_fields:
             per_doc[row.field_name] = _parse_value(row.value)
             cf.confidences.setdefault(row.field_name, row.confidence)
             if row.field_name not in cf.values:
                 cf.values[row.field_name] = _parse_value(row.value)
         cf.by_document[doc.id] = per_doc
         if per_doc and min(
-            (r.confidence for r in rows), default=1.0
+            (r.confidence for r in doc.extracted_fields), default=1.0
         ) < 0.7:
             cf.low_confidence_documents.append(doc.id)
     return cf

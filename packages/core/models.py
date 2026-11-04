@@ -80,6 +80,17 @@ class Document(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     case: Mapped[Case] = relationship(back_populates="documents")
+    pages: Mapped[list[DocumentPage]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="DocumentPage.page_no",
+    )
+    extracted_fields: Mapped[list[ExtractedField]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
 
 
 class DocumentPage(Base):
@@ -90,6 +101,8 @@ class DocumentPage(Base):
     page_no: Mapped[int] = mapped_column(Integer)
     ocr_text: Mapped[str] = mapped_column(Text, default="")
     image_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    document: Mapped[Document] = relationship(back_populates="pages")
 
 
 class ExtractedField(Base):
@@ -102,6 +115,8 @@ class ExtractedField(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     page_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bbox: Mapped[list | None] = mapped_column(JSON, nullable=True)  # [x1, y1, x2, y2]
+
+    document: Mapped[Document] = relationship(back_populates="extracted_fields")
 
 
 class Evidence(Base):
